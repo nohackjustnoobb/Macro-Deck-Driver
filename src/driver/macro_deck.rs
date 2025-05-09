@@ -3,7 +3,6 @@ use std::{
     io::{BufRead, BufReader, Cursor, Read},
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
-    thread::spawn,
 };
 
 use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader};
@@ -24,15 +23,15 @@ pub struct DeviceInfo {
     pub status_bar_height: u32,
 }
 
-pub struct MarcoDeck {
+pub struct MacroDeck {
     port: Arc<Mutex<Box<dyn SerialPort>>>,
     info: Arc<Mutex<Option<DeviceInfo>>>,
     icons: Arc<Mutex<HashMap<String, DynamicImage>>>,
     dirs: Arc<Mutex<Option<Vec<PathBuf>>>>,
     status: Arc<Mutex<Option<DynamicImage>>>,
     handoff: Arc<(Mutex<bool>, Condvar)>,
-    handlers: Arc<Mutex<HashMap<String, fn()>>>,
-    status_handler: Arc<Mutex<Option<fn(u32)>>>,
+    handlers: Arc<Mutex<HashMap<String, Box<dyn Fn() + 'static>>>>,
+    status_handler: Arc<Mutex<Option<Box<dyn Fn(u32) + 'static>>>>,
 }
 
 macro_rules! send_and_check_ok {
@@ -102,14 +101,14 @@ fn find_patch(img1: &DynamicImage, img2: &DynamicImage) -> Option<(u32, u32, Dyn
     Some((min_x, min_y, patch))
 }
 
-impl MarcoDeck {
+impl MacroDeck {
     pub fn new(path: &str) -> Result<Self, &str> {
         let port = serialport::new(path, 115200)
             .timeout(std::time::Duration::from_secs(MAX_TIMEOUT))
             .open()
             .map_err(|_| "Failed to open port")?;
 
-        Ok(MarcoDeck {
+        Ok(MacroDeck {
             port: Arc::new(Mutex::new(port)),
             info: Arc::new(Mutex::new(None)),
             icons: Arc::new(Mutex::new(HashMap::new())),
@@ -463,71 +462,76 @@ impl MarcoDeck {
         result
     }
 
-    pub fn register_handler(&self, button_path: &str, handler: fn()) {
+    pub fn register_handler<F>(&self, button_path: &str, handler: F)
+    where
+        F: Fn() + 'static,
+    {
         let mut handlers = self.handlers.lock().unwrap();
-        handlers.insert(button_path.to_string(), handler);
+        handlers.insert(button_path.to_string(), Box::new(handler));
     }
 
-    pub fn register_status_handler(&self, handler: fn(x: u32)) {
+    pub fn register_status_handler<F>(&self, handler: F)
+    where
+        F: Fn(u32) + 'static,
+    {
         let mut status_handler = self.status_handler.lock().unwrap();
-        *status_handler = Some(handler);
+        *status_handler = Some(Box::new(handler));
     }
 
     pub fn start(&self) {
         let port_lock = self.port.clone();
         let handoff_lock = self.handoff.clone();
+
         let handlers = self.handlers.clone();
         let status_handler = self.status_handler.clone();
 
-        spawn(move || {
-            let mut port = port_lock.lock().unwrap();
+        let mut port = port_lock.lock().unwrap();
 
-            loop {
-                // Check if we need to hand off the port
-                {
-                    let (lock, cvar) = &*handoff_lock;
-                    let mut lock = match lock.lock() {
-                        Ok(lock) => lock,
-                        Err(_) => continue,
-                    };
-
-                    if *lock {
-                        *lock = false;
-                        drop(port);
-
-                        drop(cvar.wait(lock).unwrap());
-                        port = port_lock.lock().unwrap();
-                    }
-                }
-
-                let mut buf_reader = BufReader::new(port.as_mut());
-                let mut line_buffer = String::new();
-                if buf_reader.read_line(&mut line_buffer).is_err() {
-                    continue;
+        loop {
+            // Check if we need to hand off the port
+            {
+                let (lock, cvar) = &*handoff_lock;
+                let mut lock = match lock.lock() {
+                    Ok(lock) => lock,
+                    Err(_) => continue,
                 };
 
-                let message = Message::decode(line_buffer);
-                if message.is_none() {
-                    continue;
-                }
+                if *lock {
+                    *lock = false;
+                    drop(port);
 
-                let message = message.unwrap();
-                if message.message_type == "bc" {
-                    let icon_path = &message.data[0];
-                    let handlers = handlers.lock().unwrap();
-                    let handler = handlers.get(icon_path).cloned();
-
-                    if let Some(handler) = handler {
-                        handler();
-                    }
-                } else if message.message_type == "sc" {
-                    let x = message.data[0].parse::<u32>().unwrap();
-                    let handler = status_handler.lock().unwrap();
-                    if let Some(handler) = handler.as_ref() {
-                        handler(x);
-                    }
+                    drop(cvar.wait(lock).unwrap());
+                    port = port_lock.lock().unwrap();
                 }
             }
-        });
+
+            let mut buf_reader = BufReader::new(port.as_mut());
+            let mut line_buffer = String::new();
+            if buf_reader.read_line(&mut line_buffer).is_err() {
+                continue;
+            };
+
+            let message = Message::decode(line_buffer);
+            if message.is_none() {
+                continue;
+            }
+
+            let message = message.unwrap();
+            if message.message_type == "bc" {
+                let icon_path = &message.data[0];
+                let handlers = handlers.lock().unwrap();
+                let handler = handlers.get(icon_path);
+
+                if let Some(handler) = handler {
+                    handler();
+                }
+            } else if message.message_type == "sc" {
+                let x = message.data[0].parse::<u32>().unwrap();
+                let handler = status_handler.lock().unwrap();
+                if let Some(handler) = handler.as_ref() {
+                    handler(x);
+                }
+            }
+        }
     }
 }
