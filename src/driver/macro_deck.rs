@@ -3,6 +3,7 @@ use std::{
     io::{BufRead, BufReader, Cursor, Read},
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
+    thread::{spawn, JoinHandle},
 };
 
 use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader};
@@ -30,8 +31,10 @@ pub struct MacroDeck {
     dirs: Arc<Mutex<Option<Vec<PathBuf>>>>,
     status: Arc<Mutex<Option<DynamicImage>>>,
     handoff: Arc<(Mutex<bool>, Condvar)>,
-    handlers: Arc<Mutex<HashMap<String, Box<dyn Fn() + 'static>>>>,
-    status_handler: Arc<Mutex<Option<Box<dyn Fn(u32) + 'static>>>>,
+    handlers: Arc<Mutex<HashMap<String, Box<dyn Fn() + Send + 'static>>>>,
+    status_handler: Arc<Mutex<Option<Box<dyn Fn(u32) + Send + 'static>>>>,
+    running: Arc<Mutex<bool>>,
+    thread_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 macro_rules! send_and_check_ok {
@@ -117,6 +120,8 @@ impl MacroDeck {
             handoff: Arc::new((Mutex::new(false), Condvar::new())),
             handlers: Arc::new(Mutex::new(HashMap::new())),
             status_handler: Arc::new(Mutex::new(None)),
+            running: Arc::new(Mutex::new(false)),
+            thread_handle: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -464,7 +469,7 @@ impl MacroDeck {
 
     pub fn register_handler<F>(&self, button_path: &str, handler: F)
     where
-        F: Fn() + 'static,
+        F: Fn() + Send + 'static,
     {
         let mut handlers = self.handlers.lock().unwrap();
         handlers.insert(button_path.to_string(), Box::new(handler));
@@ -472,7 +477,7 @@ impl MacroDeck {
 
     pub fn register_status_handler<F>(&self, handler: F)
     where
-        F: Fn(u32) + 'static,
+        F: Fn(u32) + Send + 'static,
     {
         let mut status_handler = self.status_handler.lock().unwrap();
         *status_handler = Some(Box::new(handler));
@@ -484,53 +489,88 @@ impl MacroDeck {
 
         let handlers = self.handlers.clone();
         let status_handler = self.status_handler.clone();
+        let running = self.running.clone();
 
-        let mut port = port_lock.lock().unwrap();
+        {
+            let mut is_running = running.lock().unwrap();
+            *is_running = true;
+        }
 
-        loop {
-            // Check if we need to hand off the port
-            {
-                let (lock, cvar) = &*handoff_lock;
-                let mut lock = match lock.lock() {
-                    Ok(lock) => lock,
-                    Err(_) => continue,
+        let handle = spawn(move || {
+            let mut port = port_lock.lock().unwrap();
+
+            loop {
+                // Check if we should exit
+                {
+                    let is_running = running.lock().unwrap();
+                    if !*is_running {
+                        break;
+                    }
+                }
+
+                // Check if we need to hand off the port
+                {
+                    let (lock, cvar) = &*handoff_lock;
+                    let mut lock = match lock.lock() {
+                        Ok(lock) => lock,
+                        Err(_) => continue,
+                    };
+
+                    if *lock {
+                        *lock = false;
+                        drop(port);
+
+                        drop(cvar.wait(lock).unwrap());
+                        port = port_lock.lock().unwrap();
+                    }
+                }
+
+                let mut buf_reader = BufReader::new(port.as_mut());
+                let mut line_buffer = String::new();
+                if buf_reader.read_line(&mut line_buffer).is_err() {
+                    continue;
                 };
 
-                if *lock {
-                    *lock = false;
-                    drop(port);
+                let message = Message::decode(line_buffer);
+                if message.is_none() {
+                    continue;
+                }
 
-                    drop(cvar.wait(lock).unwrap());
-                    port = port_lock.lock().unwrap();
+                let message = message.unwrap();
+                if message.message_type == "bc" {
+                    let icon_path = &message.data[0];
+                    let handlers = handlers.lock().unwrap();
+                    let handler = handlers.get(icon_path);
+
+                    if let Some(handler) = handler {
+                        handler();
+                    }
+                } else if message.message_type == "sc" {
+                    let x = message.data[0].parse::<u32>().unwrap();
+                    let handler = status_handler.lock().unwrap();
+                    if let Some(handler) = handler.as_ref() {
+                        handler(x);
+                    }
                 }
             }
+        });
 
-            let mut buf_reader = BufReader::new(port.as_mut());
-            let mut line_buffer = String::new();
-            if buf_reader.read_line(&mut line_buffer).is_err() {
-                continue;
-            };
+        // Store the thread handle
+        if let Ok(mut thread_handle) = self.thread_handle.lock() {
+            *thread_handle = Some(handle);
+        }
+    }
+}
 
-            let message = Message::decode(line_buffer);
-            if message.is_none() {
-                continue;
-            }
+impl Drop for MacroDeck {
+    fn drop(&mut self) {
+        if let Ok(mut is_running) = self.running.lock() {
+            *is_running = false;
+        }
 
-            let message = message.unwrap();
-            if message.message_type == "bc" {
-                let icon_path = &message.data[0];
-                let handlers = handlers.lock().unwrap();
-                let handler = handlers.get(icon_path);
-
-                if let Some(handler) = handler {
-                    handler();
-                }
-            } else if message.message_type == "sc" {
-                let x = message.data[0].parse::<u32>().unwrap();
-                let handler = status_handler.lock().unwrap();
-                if let Some(handler) = handler.as_ref() {
-                    handler(x);
-                }
+        if let Ok(mut handle) = self.thread_handle.lock() {
+            if let Some(thread) = handle.take() {
+                let _ = thread.join();
             }
         }
     }

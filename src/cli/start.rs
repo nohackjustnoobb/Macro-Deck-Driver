@@ -1,7 +1,14 @@
 use macro_deck_driver::MacroDeck;
 use regex::Regex;
 use serde::Deserialize;
-use std::{collections::HashMap, fs};
+use std::{
+    collections::HashMap,
+    fs,
+    io::{BufRead, BufReader},
+    net::TcpListener,
+};
+
+use crate::cli::message::Message;
 
 #[derive(Deserialize, Clone, Debug)]
 struct ButtonConfig {
@@ -40,7 +47,7 @@ fn auto_detect_port() -> Option<String> {
     }
 }
 
-pub fn start(port: Option<String>) {
+pub fn start(port: Option<String>, config_path: Option<String>, tcp_port: Option<String>) {
     let port = port.or_else(|| {
         let auto_detected_port = auto_detect_port();
         if auto_detected_port.is_none() {
@@ -58,6 +65,7 @@ pub fn start(port: Option<String>) {
 
     #[cfg(unix)]
     let port = if !re.is_match(&port) {
+        // TODO not tested
         #[cfg(target_os = "linux")]
         {
             format!("/dev/TTY{}", port)
@@ -72,9 +80,21 @@ pub fn start(port: Option<String>) {
     };
 
     println!("Loading configuration...");
-    let config_content = fs::read_to_string("config.json").expect("Failed to read config.json");
-    let config: Config =
-        serde_json::from_str(&config_content).expect("Failed to parse config.json");
+    let config_content = match fs::read_to_string(config_path.unwrap_or("config.json".to_string()))
+    {
+        Ok(content) => content,
+        Err(_) => {
+            eprintln!("Failed to read config.json");
+            return;
+        }
+    };
+    let config: Config = match serde_json::from_str(&config_content) {
+        Ok(config) => config,
+        Err(_) => {
+            eprintln!("Failed to parse config.json");
+            return;
+        }
+    };
 
     let deck = MacroDeck::new(&port);
     if deck.is_err() {
@@ -109,28 +129,90 @@ pub fn start(port: Option<String>) {
         println!("Registering button handlers...");
         for (key, button) in buttons.iter() {
             let command = button.command.clone();
+            let key = key.clone();
             let args = button.args.clone();
-            deck.register_handler(key, move || {
+            deck.register_handler(&key.clone(), move || {
                 let output = std::process::Command::new(command.clone())
                     .args(args.clone())
                     .output();
 
                 if output.is_err() {
-                    eprintln!("Failed to execute command: {}", command);
+                    eprintln!("[{}] Failed to execute command: {}", key, command);
                 } else {
                     let output = output.unwrap();
-                    if !output.stdout.is_empty() {
-                        println!(
-                            "Button command output: {}",
-                            String::from_utf8_lossy(&output.stdout)
-                        );
-                    }
+                    println!(
+                        "[{}] Command output: {}",
+                        key,
+                        if output.stdout.is_empty() {
+                            "None".to_string()
+                        } else {
+                            String::from_utf8_lossy(&output.stdout).to_string()
+                        }
+                    );
                 }
             });
         }
     }
 
-    println!("Starting listening to the serial port: {}", port);
-    println!("Press Ctrl+C to stop.");
+    println!("Start listening to the serial port: {}", port);
     deck.start();
+
+    let tcp_port = tcp_port.unwrap_or("8964".to_string());
+    let listener = match TcpListener::bind(format!("127.0.0.1:{}", tcp_port)) {
+        Ok(listener) => listener,
+        Err(_) => {
+            eprintln!("Failed to bind to TCP port");
+            return;
+        }
+    };
+
+    println!("Start listening to the TCP port: {}", tcp_port);
+    println!("Press Ctrl+C to stop.");
+
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(e) => {
+                eprintln!("Failed to accept connection: {}", e);
+                continue;
+            }
+        };
+        println!("New connection: {}", stream.peer_addr().unwrap());
+
+        let reader = BufReader::new(stream);
+        let mut stop_flag = false;
+        for line in reader.lines() {
+            let json_str = match line {
+                Ok(line) => line,
+                Err(e) => {
+                    eprintln!("Error reading from stream: {}", e);
+                    continue;
+                }
+            };
+
+            let msg: Message = match serde_json::from_str(&json_str) {
+                Ok(message) => message,
+                Err(e) => {
+                    eprintln!("Failed to parse JSON: {}", e);
+                    continue;
+                }
+            };
+
+            println!("Received Command: {:?}", msg.type_);
+            match msg.type_.as_str() {
+                "stop" => {
+                    println!("Stopping the server...");
+                    stop_flag = true;
+                    break;
+                }
+                _ => {
+                    eprintln!("Unknown command: {}", msg.type_);
+                }
+            }
+        }
+
+        if stop_flag {
+            break;
+        }
+    }
 }
