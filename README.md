@@ -34,14 +34,26 @@ The driver for Macro-Deck.
    alias mdd="macro-deck-driver"
    ```
 
+## Configuration
+
+The Macro Deck Driver needs to be configured using a `config.json` file. You can generate this configuration file using the [Config Generator](./config-generator/index.html).
+
 ## Usage
 
-To start the Macro Deck Driver:
+To start the Macro Deck Driver with the default configuration (in the same directory as `config.json`):
 
 ```bash
 macro-deck-driver start
 # or with alias
 mdd start
+```
+
+To specify a custom configuration file path:
+
+```bash
+macro-deck-driver start -c /path/to/config.json
+# or with alias
+mdd start -c /path/to/config.json
 ```
 
 To stop the Macro Deck Driver:
