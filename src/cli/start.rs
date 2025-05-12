@@ -1,26 +1,15 @@
 use macro_deck_driver::MacroDeck;
 use regex::Regex;
-use serde::Deserialize;
 use std::{
-    collections::HashMap,
     fs,
     io::{BufRead, BufReader},
     net::TcpListener,
 };
 
-use crate::cli::message::Message;
-
-#[derive(Deserialize, Clone, Debug)]
-struct ButtonConfig {
-    command: String,
-    args: Vec<String>,
-}
-
-#[derive(Deserialize, Clone, Debug)]
-struct Config {
-    buttons: Option<HashMap<String, ButtonConfig>>,
-    status: Option<ButtonConfig>,
-}
+use crate::cli::{
+    flash::flash_device,
+    models::{Config, Message},
+};
 
 #[cfg(not(unix))]
 fn auto_detect_port() -> Option<String> {
@@ -104,33 +93,42 @@ pub fn start(port: Option<String>, config_path: Option<String>, tcp_port: Option
     let deck = deck.unwrap();
 
     if let Some(status) = config.status.clone() {
-        println!("Registering status handler...");
-        deck.register_status_handler(move |x: u32| {
-            let output = std::process::Command::new(status.command.clone())
-                .args(status.args.clone())
-                .arg(x.to_string())
-                .output();
+        if let Some(command) = status.command {
+            println!("Registering status handler...");
 
-            if output.is_err() {
-                eprintln!("Failed to execute command: {}", status.command);
-            } else {
-                let output = output.unwrap();
-                if !output.stdout.is_empty() {
-                    println!(
-                        "Status command output: {}",
-                        String::from_utf8_lossy(&output.stdout)
-                    );
+            deck.register_status_handler(move |x: u32| {
+                let output = std::process::Command::new(command.clone())
+                    .args(status.args.clone().unwrap_or_default())
+                    .arg(x.to_string())
+                    .output();
+
+                if output.is_err() {
+                    eprintln!("Failed to execute command: {}", command);
+                } else {
+                    let output = output.unwrap();
+                    if !output.stdout.is_empty() {
+                        println!(
+                            "Status command output: {}",
+                            String::from_utf8_lossy(&output.stdout)
+                        );
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 
     if let Some(buttons) = config.buttons.clone() {
         println!("Registering button handlers...");
         for (key, button) in buttons.iter() {
             let command = button.command.clone();
+            if command.is_none() {
+                continue;
+            }
+
             let key = key.clone();
-            let args = button.args.clone();
+            let command = command.unwrap();
+            let args = button.args.clone().unwrap_or_default();
+
             deck.register_handler(&key.clone(), move || {
                 let output = std::process::Command::new(command.clone())
                     .args(args.clone())
@@ -157,6 +155,7 @@ pub fn start(port: Option<String>, config_path: Option<String>, tcp_port: Option
     println!("Start listening to the serial port: {}", port);
     deck.start();
 
+    // TCP server
     let tcp_port = tcp_port.unwrap_or("8964".to_string());
     let listener = match TcpListener::bind(format!("127.0.0.1:{}", tcp_port)) {
         Ok(listener) => listener,
@@ -203,6 +202,33 @@ pub fn start(port: Option<String>, config_path: Option<String>, tcp_port: Option
                 "stop" => {
                     println!("Stopping the server...");
                     stop_flag = true;
+                    break;
+                }
+                "flash" => {
+                    println!("Flashing the device...");
+
+                    let config = if let Some(config_path) = msg.value {
+                        let config_content = match fs::read_to_string(config_path) {
+                            Ok(content) => content,
+                            Err(_) => {
+                                eprintln!("Failed to read config.json");
+                                continue;
+                            }
+                        };
+
+                        match serde_json::from_str(&config_content) {
+                            Ok(config) => config,
+                            Err(_) => {
+                                eprintln!("Failed to parse config.json");
+                                continue;
+                            }
+                        }
+                    } else {
+                        config.clone()
+                    };
+
+                    flash_device(&deck, &config);
+
                     break;
                 }
                 _ => {

@@ -1,6 +1,9 @@
 mod cli;
 
-use cli::{background_start::background_start, flash::flash, list::list, start::start, stop::stop};
+use cli::{
+    background_start::background_start, flash::flash, list::list, start::start, stop::stop,
+    tools::write_icons_to_config,
+};
 
 use clap::{Parser, Subcommand};
 
@@ -38,6 +41,22 @@ enum Commands {
         #[arg(short, long)]
         config_path: Option<String>,
     },
+    #[command(about = "Tools for various tasks")]
+    Tools {
+        #[command(subcommand)]
+        tool: Tools,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum Tools {
+    #[command(about = "Write icons to config", visible_alias = "wi2c")]
+    WriteIconsToConfig {
+        #[arg(short, long)]
+        icons_dir: String,
+        #[arg(short, long)]
+        config_path: Option<String>,
+    },
 }
 
 fn main() {
@@ -62,5 +81,11 @@ fn main() {
             tcp_port,
             config_path,
         } => flash(tcp_port, config_path),
+        Commands::Tools { tool } => match tool {
+            Tools::WriteIconsToConfig {
+                icons_dir,
+                config_path,
+            } => write_icons_to_config(icons_dir, config_path),
+        },
     }
 }
