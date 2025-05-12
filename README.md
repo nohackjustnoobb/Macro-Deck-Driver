@@ -36,7 +36,7 @@ The driver for Macro-Deck.
 
 ## Configuration
 
-The Macro Deck Driver needs to be configured using a `config.json` file. You can generate this configuration file using the [Config Generator](./config-generator/index.html).
+The Macro Deck Driver needs to be configured using a `config.json` file. You can generate this configuration file using the [Config Generator](https://nohackjustnoobb.github.io/Macro-Deck-Driver/).
 
 ## Usage
 
