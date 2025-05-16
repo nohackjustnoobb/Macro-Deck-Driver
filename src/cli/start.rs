@@ -1,9 +1,13 @@
+use base64::{engine::general_purpose, Engine as _};
 use macro_deck_driver::MacroDeck;
 use regex::Regex;
+use serde_json::json;
 use std::{
     fs,
-    io::{BufRead, BufReader},
-    net::TcpListener,
+    io::{BufRead, BufReader, Write as _},
+    net::{TcpListener, TcpStream},
+    sync::{Arc, Mutex},
+    thread,
 };
 
 use crate::cli::{
@@ -11,7 +15,12 @@ use crate::cli::{
     models::{Config, Message},
 };
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
+fn auto_detect_port() -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
 fn auto_detect_port() -> Option<String> {
     None
 }
@@ -33,6 +42,24 @@ fn auto_detect_port() -> Option<String> {
         None
     } else {
         Some(filtered_ports[0].clone())
+    }
+}
+
+fn read_and_parse_config(config_path: &str) -> Option<Config> {
+    let config_content = match fs::read_to_string(config_path) {
+        Ok(content) => content,
+        Err(_) => {
+            eprintln!("Failed to read config.json");
+            return None;
+        }
+    };
+
+    match serde_json::from_str(&config_content) {
+        Ok(config) => Some(config),
+        Err(_) => {
+            eprintln!("Failed to parse config.json");
+            None
+        }
     }
 }
 
@@ -69,52 +96,46 @@ pub fn start(port: Option<String>, config_path: Option<String>, tcp_port: Option
     };
 
     println!("Loading configuration...");
-    let config_content = match fs::read_to_string(config_path.unwrap_or("config.json".to_string()))
-    {
-        Ok(content) => content,
-        Err(_) => {
-            eprintln!("Failed to read config.json");
-            return;
-        }
-    };
-    let config: Config = match serde_json::from_str(&config_content) {
-        Ok(config) => config,
-        Err(_) => {
-            eprintln!("Failed to parse config.json");
-            return;
-        }
+    let config = match read_and_parse_config(&config_path.unwrap_or("config.json".to_string())) {
+        Some(config) => config,
+        None => return,
     };
 
-    let deck = MacroDeck::new(&port);
-    if deck.is_err() {
-        eprintln!("Failed to connect to the serial port: {}", port);
-        return;
-    }
-    let deck = deck.unwrap();
+    let deck = Arc::new(MacroDeck::new(&port).expect("Failed to create MacroDeck instance"));
 
+    println!("Starting status handler...");
     if let Some(status) = config.status.clone() {
         if let Some(command) = status.command {
-            println!("Registering status handler...");
-
-            deck.register_status_handler(move |x: u32| {
-                let output = std::process::Command::new(command.clone())
-                    .args(status.args.clone().unwrap_or_default())
-                    .arg(x.to_string())
-                    .output();
-
-                if output.is_err() {
-                    eprintln!("Failed to execute command: {}", command);
-                } else {
-                    let output = output.unwrap();
-                    if !output.stdout.is_empty() {
-                        println!(
-                            "Status command output: {}",
-                            String::from_utf8_lossy(&output.stdout)
-                        );
-                    }
-                }
+            thread::spawn(move || {
+                let _ = std::process::Command::new(command.clone())
+                    .args(status.args.unwrap_or_default())
+                    .spawn()
+                    .expect("Failed to start status handler")
+                    .wait();
             });
         }
+    }
+
+    println!("Registering status handler...");
+    let status_handler_tcp_write_stream: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
+    {
+        let status_handler_tcp_write_stream = status_handler_tcp_write_stream.clone();
+        deck.register_status_handler(move |x: u32| {
+            let mut stream = status_handler_tcp_write_stream.lock().unwrap();
+            if stream.is_none() {
+                return;
+            }
+
+            let stream = stream.as_mut().unwrap();
+            let mesg = Message {
+                type_: "statusClicked".to_string(),
+                value: Some(json!(x)),
+            };
+
+            stream
+                .write_all(serde_json::to_string(&mesg).unwrap().as_bytes())
+                .expect("Failed to write to stream");
+        });
     }
 
     if let Some(buttons) = config.buttons.clone() {
@@ -157,19 +178,14 @@ pub fn start(port: Option<String>, config_path: Option<String>, tcp_port: Option
 
     // TCP server
     let tcp_port = tcp_port.unwrap_or("8964".to_string());
-    let listener = match TcpListener::bind(format!("127.0.0.1:{}", tcp_port)) {
-        Ok(listener) => listener,
-        Err(_) => {
-            eprintln!("Failed to bind to TCP port");
-            return;
-        }
-    };
+    let listener =
+        TcpListener::bind(format!("127.0.0.1:{}", tcp_port)).expect("Failed to bind TCP port");
 
     println!("Start listening to the TCP port: {}", tcp_port);
     println!("Press Ctrl+C to stop.");
 
     for stream in listener.incoming() {
-        let stream = match stream {
+        let mut stream = match stream {
             Ok(stream) => stream,
             Err(e) => {
                 eprintln!("Failed to accept connection: {}", e);
@@ -178,8 +194,10 @@ pub fn start(port: Option<String>, config_path: Option<String>, tcp_port: Option
         };
         println!("New connection: {}", stream.peer_addr().unwrap());
 
-        let reader = BufReader::new(stream);
         let mut stop_flag = false;
+        let mut set_status_handler = false;
+
+        let reader = BufReader::new(&stream);
         for line in reader.lines() {
             let json_str = match line {
                 Ok(line) => line,
@@ -199,6 +217,11 @@ pub fn start(port: Option<String>, config_path: Option<String>, tcp_port: Option
 
             println!("Received Command: {:?}", msg.type_);
             match msg.type_.as_str() {
+                "setStatusHandler" => {
+                    println!("Setting status handler...");
+                    set_status_handler = true;
+                    break;
+                }
                 "stop" => {
                     println!("Stopping the server...");
                     stop_flag = true;
@@ -208,20 +231,17 @@ pub fn start(port: Option<String>, config_path: Option<String>, tcp_port: Option
                     println!("Flashing the device...");
 
                     let config = if let Some(config_path) = msg.value {
-                        let config_content = match fs::read_to_string(config_path) {
-                            Ok(content) => content,
-                            Err(_) => {
-                                eprintln!("Failed to read config.json");
+                        let config_path = match config_path.as_str() {
+                            Some(path) => path,
+                            None => {
+                                eprintln!("Invalid config path");
                                 continue;
                             }
                         };
 
-                        match serde_json::from_str(&config_content) {
-                            Ok(config) => config,
-                            Err(_) => {
-                                eprintln!("Failed to parse config.json");
-                                continue;
-                            }
+                        match read_and_parse_config(config_path) {
+                            Some(config) => config,
+                            None => continue,
                         }
                     } else {
                         config.clone()
@@ -240,5 +260,93 @@ pub fn start(port: Option<String>, config_path: Option<String>, tcp_port: Option
         if stop_flag {
             break;
         }
+
+        if set_status_handler {
+            let info = deck.get_info().unwrap();
+
+            let mesg = Message {
+                type_: "setStatusHandler".to_string(),
+                value: Some(json!([info.width, info.status_bar_height])),
+            };
+
+            stream
+                .write_all(serde_json::to_string(&mesg).unwrap().as_bytes())
+                .expect("Failed to write to stream");
+
+            // Set stream for the status handler
+            let write_stream = stream.try_clone().expect("Failed to clone stream");
+            status_handler_tcp_write_stream
+                .lock()
+                .unwrap()
+                .replace(write_stream);
+
+            status_tcp_stream_read_handler(stream, deck.clone());
+        }
     }
+}
+
+fn status_tcp_stream_read_handler(stream: TcpStream, deck: Arc<MacroDeck>) {
+    thread::spawn(move || loop {
+        let reader = BufReader::new(&stream);
+        for line in reader.lines() {
+            let json_str = match line {
+                Ok(line) => line,
+                Err(e) => {
+                    eprintln!("Error reading from stream: {}", e);
+                    // probably the stream is closed
+                    break;
+                }
+            };
+
+            let msg: Message = match serde_json::from_str(&json_str) {
+                Ok(message) => message,
+                Err(e) => {
+                    eprintln!("Failed to parse JSON: {}", e);
+                    continue;
+                }
+            };
+
+            println!("Received Command: {:?}", msg.type_);
+            match msg.type_.as_str() {
+                "setStatus" => {
+                    let encoded = msg.value.clone();
+                    if encoded.is_none() {
+                        eprintln!("No status provided");
+                        continue;
+                    }
+                    let encoded = encoded.unwrap();
+                    let encoded = match encoded.as_str() {
+                        Some(encoded) => encoded,
+                        None => {
+                            eprintln!("Invalid status");
+                            continue;
+                        }
+                    };
+
+                    let img = match general_purpose::STANDARD.decode(encoded) {
+                        Ok(img) => img,
+                        Err(_) => {
+                            eprintln!("Failed to decode image");
+                            continue;
+                        }
+                    };
+
+                    let img = match image::load_from_memory(&img) {
+                        Ok(img) => img,
+                        Err(_) => {
+                            eprintln!("Failed to load image from memory");
+                            continue;
+                        }
+                    };
+
+                    if let Err(e) = deck.set_status(img) {
+                        eprintln!("Failed to set status: {}", e);
+                    }
+                }
+                _ => {
+                    eprintln!("Unknown command: {}", msg.type_);
+                }
+            }
+        }
+    });
 }

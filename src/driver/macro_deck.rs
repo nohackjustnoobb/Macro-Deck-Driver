@@ -517,9 +517,11 @@ impl MacroDeck {
                     };
 
                     if *lock {
+                        // handoff
                         *lock = false;
                         drop(port);
 
+                        // relock the port
                         drop(cvar.wait(lock).unwrap());
                         port = port_lock.lock().unwrap();
                     }

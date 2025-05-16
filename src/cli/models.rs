@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Message {
     #[serde(rename = "type")]
     pub type_: String,
-    pub value: Option<String>,
+    pub value: Option<Value>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

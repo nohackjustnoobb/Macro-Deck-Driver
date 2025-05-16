@@ -8,6 +8,7 @@ use base64::Engine as _;
 use image::imageops::FilterType;
 use image::{GenericImage, ImageBuffer, Rgb, RgbImage};
 use macro_deck_driver::MacroDeck;
+use serde_json::json;
 
 use super::models::{Config, Message};
 
@@ -96,6 +97,7 @@ pub fn flash_device(deck: &MacroDeck, config: &Config) {
                     continue;
                 }
             };
+
             // Resize the icon to fit the button size
             let icon = icon
                 .resize_exact(info.button_size, info.button_size, FilterType::Lanczos3)
@@ -152,7 +154,7 @@ pub fn flash(tcp_port: Option<String>, config_path: Option<String>) {
 
     let msg = Message {
         type_: "flash".to_string(),
-        value: config_path,
+        value: config_path.map(|v| json!(v)),
     };
 
     let json = serde_json::to_string(&msg).unwrap();
