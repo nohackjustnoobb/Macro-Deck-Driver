@@ -60,6 +60,8 @@ enum Tools {
 }
 
 fn main() {
+    env_logger::init();
+
     let cli = Cli::parse();
 
     match cli.command {

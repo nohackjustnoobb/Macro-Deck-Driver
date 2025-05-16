@@ -196,7 +196,10 @@ impl MacroDeck {
             .map_err(|_| "Failed to read message")?;
 
         let message = Message::decode(line_buffer).ok_or("Failed to decode message")?;
-        if message.message_type == "rd?" {}
+        if message.message_type != "rd?" {
+            return Err("Failed to get icon");
+        }
+
         let size = message.data[0]
             .parse::<u32>()
             .map_err(|_| "Failed to parse size")?;
@@ -377,7 +380,7 @@ impl MacroDeck {
             return Err("Failed to set status");
         }
 
-        *old_status = Some(status);
+        old_status.replace(status);
         Ok(())
     }
 
@@ -415,6 +418,10 @@ impl MacroDeck {
         cvar.notify_all();
 
         let message = Message::decode(line_buffer).ok_or("Failed to decode message")?;
+        if message.message_type != "ld" {
+            return Err("Failed to list directory");
+        }
+
         let new_dirs: Vec<PathBuf> = message.data.iter().map(|str| PathBuf::from(str)).collect();
 
         *dirs = Some(new_dirs.clone());

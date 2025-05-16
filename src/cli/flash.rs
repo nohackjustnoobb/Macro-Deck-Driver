@@ -7,16 +7,17 @@ use base64::engine::general_purpose;
 use base64::Engine as _;
 use image::imageops::FilterType;
 use image::{GenericImage, ImageBuffer, Rgb, RgbImage};
+use log::{debug, error, info};
 use macro_deck_driver::MacroDeck;
 use serde_json::json;
 
 use super::models::{Config, Message};
 
 pub fn flash_device(deck: &MacroDeck, config: &Config) {
-    println!("Creating aio images...");
+    debug!("Creating aio images...");
 
     if config.buttons.is_none() {
-        eprintln!("No buttons found in config");
+        error!("No buttons found in config");
         return;
     }
 
@@ -27,7 +28,7 @@ pub fn flash_device(deck: &MacroDeck, config: &Config) {
             let path = match PathBuf::from_str(key) {
                 Ok(path) => path,
                 Err(_) => {
-                    eprintln!("Invalid icon path: {}", key);
+                    error!("Invalid icon path: {}", key);
                     continue;
                 }
             };
@@ -35,7 +36,7 @@ pub fn flash_device(deck: &MacroDeck, config: &Config) {
             let parent = match path.parent() {
                 Some(parent) => parent.to_str().unwrap(),
                 None => {
-                    eprintln!("Invalid icon path: {}", key);
+                    error!("Invalid icon path: {}", key);
                     continue;
                 }
             };
@@ -43,7 +44,7 @@ pub fn flash_device(deck: &MacroDeck, config: &Config) {
             let idx = match path.file_name() {
                 Some(idx) => idx,
                 None => {
-                    eprintln!("Invalid icon path: {}", key);
+                    error!("Invalid icon path: {}", key);
                     continue;
                 }
             };
@@ -51,7 +52,7 @@ pub fn flash_device(deck: &MacroDeck, config: &Config) {
             let idx = match idx.parse::<usize>() {
                 Ok(idx) => idx,
                 Err(_) => {
-                    eprintln!("Invalid icon path: {}", key);
+                    error!("Invalid icon path: {}", key);
                     continue;
                 }
             };
@@ -69,7 +70,7 @@ pub fn flash_device(deck: &MacroDeck, config: &Config) {
     let info = match deck.get_info() {
         Ok(info) => info,
         Err(_) => {
-            eprintln!("Failed to get device info");
+            error!("Failed to get device info");
             return;
         }
     };
@@ -85,7 +86,7 @@ pub fn flash_device(deck: &MacroDeck, config: &Config) {
             let icon = match general_purpose::STANDARD.decode(icon) {
                 Ok(icon) => icon,
                 Err(_) => {
-                    eprintln!("Failed to decode icon: {}", idx);
+                    error!("Failed to decode icon: {}", idx);
                     continue;
                 }
             };
@@ -93,7 +94,7 @@ pub fn flash_device(deck: &MacroDeck, config: &Config) {
             let icon = match image::load_from_memory(&icon) {
                 Ok(icon) => icon,
                 Err(_) => {
-                    eprintln!("Failed to load icon: {}", idx);
+                    error!("Failed to load icon: {}", idx);
                     continue;
                 }
             };
@@ -110,7 +111,7 @@ pub fn flash_device(deck: &MacroDeck, config: &Config) {
             let y = row * (info.button_size + info.gap_size);
 
             if aio.copy_from(&icon, x, y).is_err() {
-                eprintln!("Failed to copy icon: {}", idx);
+                error!("Failed to copy icon: {}", idx);
                 continue;
             }
         }
@@ -119,27 +120,27 @@ pub fn flash_device(deck: &MacroDeck, config: &Config) {
     }
 
     // Format the device
-    println!("Formatting device...");
+    info!("Formatting device...");
     if deck.remove_folder("/").is_err() {
-        eprintln!("Failed to format device");
+        error!("Failed to format device");
         return;
     }
 
     // Write the images to the device
     for (dir, aio) in aio_hashmap {
         let dir = format!("{}/aio.jpg", dir);
-        println!("Writing icon: {}", dir);
+        debug!("Writing icon: {}", dir);
 
         if deck
             .set_icon(&dir, image::DynamicImage::ImageRgb8(aio))
             .is_err()
         {
-            eprintln!("Failed to write icon: {}", dir);
+            error!("Failed to write icon: {}", dir);
             continue;
         }
     }
 
-    println!("Flash complete!");
+    info!("Flash complete!");
 }
 
 pub fn flash(tcp_port: Option<String>, config_path: Option<String>) {

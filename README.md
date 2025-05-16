@@ -136,7 +136,7 @@ This message updates the device's status bar with a new image.
 
    This is the driver's response to the `setStatusHandler` message, providing the resolution of the status bar.
 
-   ```json
+   ```jsonc
    {
      "type": "setStatusHandler",
      "value": [1920, 1080] // Resolution of the status bar
@@ -147,7 +147,7 @@ This message updates the device's status bar with a new image.
 
    This message is sent by the driver when the status bar is clicked, providing the x-coordinate of the click position.
 
-   ```json
+   ```jsonc
    {
      "type": "statusClicked",
      "value": 123 // x-coordinate of the click position
