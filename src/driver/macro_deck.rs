@@ -27,6 +27,7 @@ pub struct DeviceInfo {
 
 pub struct MacroDeck {
     port: Arc<Mutex<Box<dyn SerialPort>>>,
+    static_read_handler: Arc<Mutex<Option<Box<dyn Fn(Message) + Send + 'static>>>>,
     read_handler: Arc<Mutex<Vec<Box<dyn Fn(Message) + Send + 'static>>>>,
     info: Arc<Mutex<Option<DeviceInfo>>>,
     icons: Arc<Mutex<HashMap<String, DynamicImage>>>,
@@ -98,9 +99,12 @@ impl MacroDeck {
 
         let read_handler: Arc<Mutex<Vec<Box<dyn Fn(Message) + Send + 'static>>>> =
             Arc::new(Mutex::new(vec![]));
+        let static_read_handler: Arc<Mutex<Option<Box<dyn Fn(Message) + Send + 'static>>>> =
+            Arc::new(Mutex::new(None));
 
         let port_clone = port.try_clone().map_err(|_| "Failed to clone port")?;
         let read_handler_clone = read_handler.clone();
+        let static_read_handler_clone = static_read_handler.clone();
         thread::spawn(move || {
             let mut buf_reader = BufReader::new(port_clone);
             let mut line_buffer = String::new();
@@ -119,16 +123,23 @@ impl MacroDeck {
                 };
                 line_buffer.clear();
 
-                let handlers = read_handler_clone.lock().unwrap();
+                let static_handler = static_read_handler_clone.lock().unwrap();
+                if let Some(handler) = static_handler.as_ref() {
+                    handler(mesg.clone());
+                }
+
+                let mut handlers = read_handler_clone.lock().unwrap();
                 for handler in handlers.iter() {
                     handler(mesg.clone());
                 }
+                handlers.clear();
             }
         });
 
         Ok(MacroDeck {
             port: Arc::new(Mutex::new(port)),
-            read_handler: read_handler,
+            read_handler,
+            static_read_handler,
             info: Arc::new(Mutex::new(None)),
             icons: Arc::new(Mutex::new(HashMap::new())),
             dirs: Arc::new(Mutex::new(None)),
@@ -167,6 +178,7 @@ impl MacroDeck {
         mesg.0.clone().ok_or("Failed to read message")
     }
 
+    // FIXME probably not working
     fn read_exact(&self, buf: &mut [u8]) -> Result<(), &str> {
         println!("Reading {} bytes", buf.len());
 
@@ -457,11 +469,12 @@ impl MacroDeck {
     }
 
     pub fn start(&self) {
-        let mut read_handler = self.read_handler.lock().unwrap();
+        let mut static_read_handler = self.static_read_handler.lock().unwrap();
+
         let handlers = self.handlers.clone();
         let status_handler = self.status_handler.clone();
 
-        read_handler.push(Box::new(move |mesg| {
+        static_read_handler.replace(Box::new(move |mesg| {
             if mesg.message_type == "bc" {
                 let icon_path = &mesg.data[0];
                 let handlers = handlers.lock().unwrap();

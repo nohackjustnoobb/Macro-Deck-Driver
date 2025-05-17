@@ -118,6 +118,8 @@ pub fn start(port: Option<String>, config_path: Option<String>, tcp_port: Option
                     .spawn()
                     .expect("Failed to start status handler")
                     .wait();
+
+                error!("Status handler crashed, restarting...");
             });
         }
     }
