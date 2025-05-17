@@ -108,9 +108,9 @@ pub fn start(port: Option<String>, config_path: Option<String>, tcp_port: Option
     info!("Starting status handler...");
     if let Some(status) = config.status.clone() {
         if let Some(command) = status.command {
-            thread::spawn(move || {
+            thread::spawn(move || loop {
                 let _ = std::process::Command::new(command.clone())
-                    .args(status.args.unwrap_or_default())
+                    .args(status.args.clone().unwrap_or_default())
                     .stderr(Stdio::null())
                     .stdout(Stdio::null())
                     .spawn()
