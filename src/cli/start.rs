@@ -17,6 +17,8 @@ use crate::cli::{
     models::{Config, Message},
 };
 
+const MAX_TRIES: u32 = 5;
+
 #[cfg(not(any(unix, windows)))]
 fn auto_detect_port() -> Option<String> {
     None
@@ -267,12 +269,28 @@ pub fn start(port: Option<String>, config_path: Option<String>, tcp_port: Option
         }
 
         if set_status_handler {
-            let info = match deck.get_info() {
-                Ok(info) => info,
-                Err(e) => {
-                    error!("Failed to get device info: {}", e);
-                    continue;
+            let mut info = deck.get_info();
+
+            let mut tries = 0;
+            loop {
+                if info.is_ok() {
+                    break;
                 }
+
+                debug!("Failed to get info: {}", info.unwrap_err());
+                debug!("Retrying...");
+                info = deck.get_info();
+
+                tries += 1;
+                if tries >= MAX_TRIES {
+                    error!("Failed to get info after {} tries", MAX_TRIES);
+                    break;
+                }
+            }
+
+            let info = match info {
+                Ok(info) => info,
+                Err(_) => continue,
             };
 
             let mesg = Message {
@@ -298,8 +316,6 @@ pub fn start(port: Option<String>, config_path: Option<String>, tcp_port: Option
 }
 
 fn status_tcp_stream_read_handler(stream: TcpStream, deck: Arc<MacroDeck>) {
-    const MAX_TRIES: u32 = 5;
-
     thread::spawn(move || loop {
         let reader = BufReader::new(&stream);
         for line in reader.lines() {
@@ -354,13 +370,17 @@ fn status_tcp_stream_read_handler(stream: TcpStream, deck: Arc<MacroDeck>) {
                     };
 
                     let mut tries = 0;
+                    let mut result = deck.set_status(img.clone());
                     loop {
-                        if deck.set_status(img.clone()).is_ok() {
+                        if result.is_ok() {
                             debug!("Status set successfully");
                             break;
                         }
 
-                        debug!("Failed to set status, retrying...");
+                        debug!("Failed to set status: {}", result.unwrap_err());
+                        debug!("Retrying...");
+
+                        result = deck.set_status(img.clone());
 
                         tries += 1;
                         if tries >= MAX_TRIES {

@@ -3,7 +3,8 @@ use std::{
     io::{BufRead, BufReader, Cursor, Read},
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
-    thread::{spawn, JoinHandle},
+    thread,
+    time::Duration,
 };
 
 use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader};
@@ -26,39 +27,23 @@ pub struct DeviceInfo {
 
 pub struct MacroDeck {
     port: Arc<Mutex<Box<dyn SerialPort>>>,
+    read_handler: Arc<Mutex<Vec<Box<dyn Fn(Message) + Send + 'static>>>>,
     info: Arc<Mutex<Option<DeviceInfo>>>,
     icons: Arc<Mutex<HashMap<String, DynamicImage>>>,
     dirs: Arc<Mutex<Option<Vec<PathBuf>>>>,
     status: Arc<Mutex<Option<DynamicImage>>>,
-    handoff: Arc<(Mutex<bool>, Condvar)>,
     handlers: Arc<Mutex<HashMap<String, Box<dyn Fn() + Send + 'static>>>>,
     status_handler: Arc<Mutex<Option<Box<dyn Fn(u32) + Send + 'static>>>>,
-    running: Arc<Mutex<bool>>,
-    thread_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 macro_rules! send_and_check_ok {
     ($self:ident, $msg_type:expr, $data:expr, $err_msg:expr) => {{
-        let (lock, cvar) = &*$self.handoff;
-        let mut handoff = lock.lock().map_err(|_| "Failed to lock handoff")?;
-        *handoff = true;
-        drop(handoff);
+        $self.write(&Message::new(
+            $msg_type.to_string(),
+            vec![$data.to_string()],
+        ))?;
 
-        let mut port = $self.port.lock().map_err(|_| "Failed to lock port")?;
-
-        port.write(&Message::new($msg_type.to_string(), vec![$data.to_string()]).encode())
-            .map_err(|_| "Failed to write to port")?;
-
-        let mut buf_reader = BufReader::new(port.as_mut());
-        let mut line_buffer = String::new();
-        buf_reader
-            .read_line(&mut line_buffer)
-            .map_err(|_| "Failed to read message")?;
-
-        drop(port);
-        cvar.notify_all();
-
-        let message = Message::decode(line_buffer).ok_or("Failed to decode message")?;
+        let message = $self.read()?;
         if message.message_type != "ok" {
             return Err($err_msg);
         }
@@ -111,18 +96,105 @@ impl MacroDeck {
             .open()
             .map_err(|_| "Failed to open port")?;
 
+        let read_handler: Arc<Mutex<Vec<Box<dyn Fn(Message) + Send + 'static>>>> =
+            Arc::new(Mutex::new(vec![]));
+
+        let port_clone = port.try_clone().map_err(|_| "Failed to clone port")?;
+        let read_handler_clone = read_handler.clone();
+        thread::spawn(move || {
+            let mut buf_reader = BufReader::new(port_clone);
+            let mut line_buffer = String::new();
+
+            loop {
+                if buf_reader.read_line(&mut line_buffer).is_err() {
+                    continue;
+                }
+
+                let mesg = match Message::decode(line_buffer.clone()) {
+                    Some(msg) => msg,
+                    None => {
+                        line_buffer.clear();
+                        continue;
+                    }
+                };
+                line_buffer.clear();
+
+                let handlers = read_handler_clone.lock().unwrap();
+                for handler in handlers.iter() {
+                    handler(mesg.clone());
+                }
+            }
+        });
+
         Ok(MacroDeck {
             port: Arc::new(Mutex::new(port)),
+            read_handler: read_handler,
             info: Arc::new(Mutex::new(None)),
             icons: Arc::new(Mutex::new(HashMap::new())),
             dirs: Arc::new(Mutex::new(None)),
             status: Arc::new(Mutex::new(None)),
-            handoff: Arc::new((Mutex::new(false), Condvar::new())),
             handlers: Arc::new(Mutex::new(HashMap::new())),
             status_handler: Arc::new(Mutex::new(None)),
-            running: Arc::new(Mutex::new(false)),
-            thread_handle: Arc::new(Mutex::new(None)),
         })
+    }
+
+    fn read(&self) -> Result<Message, &str> {
+        let mesg: Arc<(Mutex<Option<Message>>, Condvar)> =
+            Arc::new((Mutex::new(None), Condvar::new()));
+
+        {
+            let mut read_handler = self
+                .read_handler
+                .lock()
+                .map_err(|_| "Failed to lock read handler")?;
+
+            let mesg_clone = mesg.clone();
+
+            read_handler.push(Box::new(move |rec_mesg| {
+                let (lock, cvar) = &*mesg_clone;
+                let mut mesg = lock.lock().unwrap();
+                *mesg = Some(rec_mesg);
+                cvar.notify_all();
+            }));
+        }
+
+        let (lock, cvar) = &*mesg;
+        let mesg = lock.lock().unwrap();
+        let mesg = cvar
+            .wait_timeout(mesg, Duration::from_secs(MAX_TIMEOUT))
+            .map_err(|_| "Failed to wait for message")?;
+
+        mesg.0.clone().ok_or("Failed to read message")
+    }
+
+    fn read_exact(&self, buf: &mut [u8]) -> Result<(), &str> {
+        println!("Reading {} bytes", buf.len());
+
+        let mut port = self.port.lock().map_err(|_| "Failed to lock port")?;
+        let mut buf_reader = BufReader::new(port.as_mut());
+
+        buf_reader
+            .read_exact(buf)
+            .map_err(|_| "Failed to read buffer")?;
+
+        Ok(())
+    }
+
+    fn write(&self, message: &Message) -> Result<(), &str> {
+        self.write_buffer(&message.encode())
+    }
+
+    fn write_buffer(&self, buffer: &[u8]) -> Result<(), &str> {
+        let mut port = self.port.lock().map_err(|_| "Failed to lock port")?;
+
+        let total_bytes = buffer.len();
+        let written = port.write(buffer).map_err(|_| "Failed to write to port")?;
+
+        if written == total_bytes {
+            Ok(())
+        } else {
+            Err("Failed to write all bytes")
+        }
     }
 
     pub fn get_info(&self) -> Result<DeviceInfo, &str> {
@@ -131,25 +203,12 @@ impl MacroDeck {
             return Ok(info.clone().unwrap());
         }
 
-        let (lock, cvar) = &*self.handoff;
-        let mut handoff = lock.lock().map_err(|_| "Failed to lock handoff")?;
-        *handoff = true;
-        drop(handoff);
+        self.write(&Message::new("li".to_string(), Vec::new()))?;
 
-        let mut port = self.port.lock().map_err(|_| "Failed to lock port")?;
-        port.write(&Message::new("li".to_string(), Vec::new()).encode())
-            .map_err(|_| "Failed to write to port")?;
-
-        let mut buf_reader = BufReader::new(port.as_mut());
-        let mut line_buffer = String::new();
-        buf_reader
-            .read_line(&mut line_buffer)
-            .map_err(|_| "Failed to read message")?;
-
-        drop(port);
-        cvar.notify_all();
-
-        let message = Message::decode(line_buffer).ok_or("Failed to decode message")?;
+        let message = self.read()?;
+        if message.message_type != "li" {
+            return Err("Failed to get device info");
+        }
 
         let width = message.data[0].parse().unwrap();
         let height = message.data[1].parse().unwrap();
@@ -180,22 +239,9 @@ impl MacroDeck {
             return Ok(icon.clone());
         }
 
-        let (lock, cvar) = &*self.handoff;
-        let mut handoff = lock.lock().map_err(|_| "Failed to lock handoff")?;
-        *handoff = true;
-        drop(handoff);
+        self.write(&Message::new("ri".to_string(), vec![path.to_string()]))?;
 
-        let mut port = self.port.lock().map_err(|_| "Failed to lock port")?;
-        port.write(&Message::new("ri".to_string(), vec![path.to_string()]).encode())
-            .map_err(|_| "Failed to write to port")?;
-
-        let mut buf_reader = BufReader::new(port.as_mut());
-        let mut line_buffer = String::new();
-        buf_reader
-            .read_line(&mut line_buffer)
-            .map_err(|_| "Failed to read message")?;
-
-        let message = Message::decode(line_buffer).ok_or("Failed to decode message")?;
+        let message = self.read()?;
         if message.message_type != "rd?" {
             return Err("Failed to get icon");
         }
@@ -204,18 +250,10 @@ impl MacroDeck {
             .parse::<u32>()
             .map_err(|_| "Failed to parse size")?;
 
-        buf_reader
-            .get_mut()
-            .write(&Message::new("rd".to_string(), vec![]).encode())
-            .map_err(|_| "Failed to write to port")?;
+        self.write(&Message::new("rd".to_string(), vec![]))?;
 
         let mut buffer = vec![0; size as usize];
-        buf_reader
-            .read_exact(&mut buffer)
-            .map_err(|_| "Failed to read icon")?;
-
-        drop(port);
-        cvar.notify_all();
+        self.read_exact(&mut buffer)?;
 
         let icon = ImageReader::new(Cursor::new(buffer))
             .with_guessed_format()
@@ -263,47 +301,19 @@ impl MacroDeck {
         let mut icons = self.icons.lock().map_err(|_| "Failed to lock icons")?;
         icons.insert(icon_path.to_string(), icon);
 
-        let (lock, cvar) = &*self.handoff;
-        let mut handoff = lock.lock().map_err(|_| "Failed to lock handoff")?;
-        *handoff = true;
-        drop(handoff);
+        self.write(&Message::new(
+            "wi".to_string(),
+            vec![icon_path.to_string(), buffer.len().to_string()],
+        ))?;
 
-        let mut port = self.port.lock().map_err(|_| "Failed to lock port")?;
-
-        port.write(
-            &Message::new(
-                "wi".to_string(),
-                vec![icon_path.to_string(), buffer.len().to_string()],
-            )
-            .encode(),
-        )
-        .map_err(|_| "Failed to write to port")?;
-
-        let mut buf_reader = BufReader::new(port.as_mut());
-        let mut line_buffer = String::new();
-        buf_reader
-            .read_line(&mut line_buffer)
-            .map_err(|_| "Failed to read message")?;
-
-        let message = Message::decode(line_buffer).ok_or("Failed to decode message")?;
+        let message = self.read()?;
         if message.message_type != "rd" {
             return Err("Failed to write icon");
         }
 
-        buf_reader
-            .get_mut()
-            .write(&buffer)
-            .map_err(|_| "Failed to write icon")?;
+        self.write_buffer(&buffer)?;
 
-        let mut line_buffer = String::new();
-        buf_reader
-            .read_line(&mut line_buffer)
-            .map_err(|_| "Failed to read message")?;
-
-        drop(port);
-        cvar.notify_all();
-
-        let message = Message::decode(line_buffer).ok_or("Failed to decode message")?;
+        let message = self.read()?;
         if message.message_type != "ok" {
             return Err("Failed to write icon");
         }
@@ -335,47 +345,19 @@ impl MacroDeck {
             .write_to(&mut Cursor::new(&mut buffer), ImageFormat::Jpeg)
             .map_err(|_| "Failed to write image")?;
 
-        let (lock, cvar) = &*self.handoff;
-        let mut handoff = lock.lock().map_err(|_| "Failed to lock handoff")?;
-        *handoff = true;
-        drop(handoff);
+        self.write(&Message::new(
+            "ss".to_string(),
+            vec![x.to_string(), y.to_string(), buffer.len().to_string()],
+        ))?;
 
-        let mut port = self.port.lock().map_err(|_| "Failed to lock port")?;
-
-        port.write(
-            &Message::new(
-                "ss".to_string(),
-                vec![x.to_string(), y.to_string(), buffer.len().to_string()],
-            )
-            .encode(),
-        )
-        .map_err(|_| "Failed to write to port")?;
-
-        let mut buf_reader = BufReader::new(port.as_mut());
-        let mut line_buffer = String::new();
-        buf_reader
-            .read_line(&mut line_buffer)
-            .map_err(|_| "Failed to read message")?;
-
-        let message = Message::decode(line_buffer).ok_or("Failed to decode message")?;
+        let message = self.read()?;
         if message.message_type != "rd" {
             return Err("Failed to set status");
         }
 
-        buf_reader
-            .get_mut()
-            .write(&buffer)
-            .map_err(|_| "Failed to set status")?;
+        self.write_buffer(&buffer)?;
 
-        let mut line_buffer = String::new();
-        buf_reader
-            .read_line(&mut line_buffer)
-            .map_err(|_| "Failed to read message")?;
-
-        drop(port);
-        cvar.notify_all();
-
-        let message = Message::decode(line_buffer).ok_or("Failed to decode message")?;
+        let message = self.read()?;
         if message.message_type != "ok" {
             return Err("Failed to set status");
         }
@@ -399,25 +381,9 @@ impl MacroDeck {
             return Ok(dirs.clone().unwrap());
         }
 
-        let (lock, cvar) = &*self.handoff;
-        let mut handoff = lock.lock().map_err(|_| "Failed to lock handoff")?;
-        *handoff = true;
-        drop(handoff);
+        self.write(&Message::new("ld".to_string(), Vec::new()))?;
 
-        let mut port = self.port.lock().map_err(|_| "Failed to lock port")?;
-        port.write(&Message::new("ld".to_string(), Vec::new()).encode())
-            .map_err(|_| "Failed to write to port")?;
-
-        let mut buf_reader = BufReader::new(port.as_mut());
-        let mut line_buffer = String::new();
-        buf_reader
-            .read_line(&mut line_buffer)
-            .map_err(|_| "Failed to read message")?;
-
-        drop(port);
-        cvar.notify_all();
-
-        let message = Message::decode(line_buffer).ok_or("Failed to decode message")?;
+        let message = self.read()?;
         if message.message_type != "ld" {
             return Err("Failed to list directory");
         }
@@ -491,96 +457,26 @@ impl MacroDeck {
     }
 
     pub fn start(&self) {
-        let port_lock = self.port.clone();
-        let handoff_lock = self.handoff.clone();
-
+        let mut read_handler = self.read_handler.lock().unwrap();
         let handlers = self.handlers.clone();
         let status_handler = self.status_handler.clone();
-        let running = self.running.clone();
 
-        {
-            let mut is_running = running.lock().unwrap();
-            *is_running = true;
-        }
+        read_handler.push(Box::new(move |mesg| {
+            if mesg.message_type == "bc" {
+                let icon_path = &mesg.data[0];
+                let handlers = handlers.lock().unwrap();
+                let handler = handlers.get(icon_path);
 
-        let handle = spawn(move || {
-            let mut port = port_lock.lock().unwrap();
-
-            loop {
-                // Check if we should exit
-                {
-                    let is_running = running.lock().unwrap();
-                    if !*is_running {
-                        break;
-                    }
+                if let Some(handler) = handler {
+                    handler();
                 }
-
-                // Check if we need to hand off the port
-                {
-                    let (lock, cvar) = &*handoff_lock;
-                    let mut lock = match lock.lock() {
-                        Ok(lock) => lock,
-                        Err(_) => continue,
-                    };
-
-                    if *lock {
-                        // handoff
-                        *lock = false;
-                        drop(port);
-
-                        // relock the port
-                        drop(cvar.wait(lock).unwrap());
-                        port = port_lock.lock().unwrap();
-                    }
-                }
-
-                let mut buf_reader = BufReader::new(port.as_mut());
-                let mut line_buffer = String::new();
-                if buf_reader.read_line(&mut line_buffer).is_err() {
-                    continue;
-                };
-
-                let message = Message::decode(line_buffer);
-                if message.is_none() {
-                    continue;
-                }
-
-                let message = message.unwrap();
-                if message.message_type == "bc" {
-                    let icon_path = &message.data[0];
-                    let handlers = handlers.lock().unwrap();
-                    let handler = handlers.get(icon_path);
-
-                    if let Some(handler) = handler {
-                        handler();
-                    }
-                } else if message.message_type == "sc" {
-                    let x = message.data[0].parse::<u32>().unwrap();
-                    let handler = status_handler.lock().unwrap();
-                    if let Some(handler) = handler.as_ref() {
-                        handler(x);
-                    }
+            } else if mesg.message_type == "sc" {
+                let x = mesg.data[0].parse::<u32>().unwrap();
+                let handler = status_handler.lock().unwrap();
+                if let Some(handler) = handler.as_ref() {
+                    handler(x);
                 }
             }
-        });
-
-        // Store the thread handle
-        if let Ok(mut thread_handle) = self.thread_handle.lock() {
-            *thread_handle = Some(handle);
-        }
-    }
-}
-
-impl Drop for MacroDeck {
-    fn drop(&mut self) {
-        if let Ok(mut is_running) = self.running.lock() {
-            *is_running = false;
-        }
-
-        if let Ok(mut handle) = self.thread_handle.lock() {
-            if let Some(thread) = handle.take() {
-                let _ = thread.join();
-            }
-        }
+        }));
     }
 }
